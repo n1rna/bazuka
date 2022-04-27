@@ -1,15 +1,26 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 
-use crate::config;
+use crate::blockchain::header::{HeaderMeta, HeaderMetaCache};
+use crate::blockchain::BlockchainError::KvStoreError;
 use crate::config::{genesis, TOTAL_SUPPLY};
-use crate::core::{Account, Address, Block, Header, Transaction, TransactionData};
-use crate::db::{KvStore, KvStoreError, RamMirrorKvStore, StringKey, WriteOp};
+use crate::core::{Account, Address, Block, BlockId, Hash, Header, Transaction, TransactionData};
+use crate::db::key_space::KeySpace;
+use crate::db::{
+    key_space, number_key, Blob, Database, KvStore, RamMirrorKvStore, StringKey, WriteOp,
+};
 use crate::wallet::Wallet;
+use crate::{config, db};
+
+mod header;
+
+pub type Result<T> = core::result::Result<T, BlockchainError>;
 
 #[derive(Error, Debug)]
 pub enum BlockchainError {
     #[error("kvstore error happened")]
-    KvStoreError(#[from] KvStoreError),
+    KvStoreError(#[from] db::KvStoreError),
     #[error("transaction signature is invalid")]
     SignatureError,
     #[error("balance insufficient")]
@@ -32,30 +43,96 @@ pub enum BlockchainError {
     InvalidTransactionNonce,
     #[error("unmet difficulty target")]
     DifficultyTargetUnmet,
+    #[error("unknown block: {0}")]
+    UnknownBlock(String),
+    #[error("error: {0}")]
+    Custom(String),
 }
 
 pub trait Blockchain {
-    fn get_account(&self, addr: Address) -> Result<Account, BlockchainError>;
-    fn will_extend(&self, from: usize, headers: &Vec<Header>) -> Result<bool, BlockchainError>;
-    fn extend(&mut self, from: usize, blocks: &Vec<Block>) -> Result<(), BlockchainError>;
-    fn draft_block(
-        &self,
-        mempool: &Vec<Transaction>,
-        wallet: &Wallet,
-    ) -> Result<Block, BlockchainError>;
-    fn get_height(&self) -> Result<usize, BlockchainError>;
-    fn get_headers(
-        &self,
-        since: usize,
-        until: Option<usize>,
-    ) -> Result<Vec<Header>, BlockchainError>;
-    fn get_blocks(&self, since: usize, until: Option<usize>)
-        -> Result<Vec<Block>, BlockchainError>;
+    fn get_account(&self, addr: Address) -> Result<Account>;
+    fn will_extend(&self, from: usize, headers: &Vec<Header>) -> Result<bool>;
+    fn extend(&mut self, from: usize, blocks: &Vec<Block>) -> Result<()>;
+    fn draft_block(&self, mempool: &Vec<Transaction>, wallet: &Wallet) -> Result<Block>;
+    fn get_height(&self) -> Result<usize>;
+    fn get_headers(&self, since: usize, until: Option<usize>) -> Result<Vec<Header>>;
+    fn get_blocks(&self, since: usize, until: Option<usize>) -> Result<Vec<Block>>;
 
     #[cfg(feature = "pow")]
-    fn get_power(&self) -> Result<u64, BlockchainError>;
+    fn get_power(&self) -> Result<u64>;
     #[cfg(feature = "pow")]
-    fn pow_key(&self, index: usize) -> Result<Vec<u8>, BlockchainError>;
+    fn pow_key(&self, index: usize) -> Result<Vec<u8>>;
+}
+
+pub trait HeaderBackend: Sync + Send {
+    fn header(&self, id: BlockId) -> Result<Option<Header>>;
+    fn header_meta(&self, hash: Hash) -> Result<HeaderMeta>;
+    fn put_header_meta(&self, header: HeaderMeta);
+    fn remove_header_meta(&self, hash: Hash);
+}
+
+pub struct DataBackend<D: Database> {
+    database: Arc<D>,
+    header_meta: HeaderMetaCache,
+}
+
+impl<D: Database> DataBackend<D> {
+    fn read_by_index<T>(&self, index: &[u8], dst_space: KeySpace) -> Result<Option<T>> {
+        let blob = match self.database.get(KeySpace::INDEX, index)? {
+            None => Ok(None),
+            Some(index) => self.database.get(dst_space, &index.0),
+        }?;
+        match blob {
+            None => Ok(None),
+            Some(blob) => {
+                let t = bincode::deserialize(&blob.0)
+                    .map_err(|e| BlockchainError::Custom(format!("{}", e)))?;
+                Ok(Some(t))
+            }
+        }
+    }
+}
+
+impl<D: Database> HeaderBackend for DataBackend<D> {
+    fn header(&self, id: BlockId) -> Result<Option<Header>> {
+        match &id {
+            BlockId::Hash(h) => self.read_by_index(h, KeySpace::HEADER),
+            BlockId::Number(n) => {
+                let n = number_key(*n)?;
+                self.read_by_index(&n, KeySpace::HEADER)
+            }
+        }
+    }
+
+    fn header_meta(&self, hash: Hash) -> Result<HeaderMeta> {
+        self.header_meta.header_metadata(hash).map_or_else(
+            || {
+                self.header(BlockId::Hash(hash))?
+                    .map(|header| {
+                        let meta = HeaderMeta::from(&header);
+                        self.header_meta
+                            .insert_header_metadata(hash.clone(), meta.clone());
+                        meta
+                    })
+                    .ok_or_else(|| {
+                        BlockchainError::UnknownBlock(format!(
+                            "header was not found which one with hash: {:?}",
+                            hash
+                        ))
+                    })
+            },
+            Ok,
+        )
+    }
+
+    fn put_header_meta(&self, header: HeaderMeta) {
+        self.header_meta
+            .insert_header_metadata(header.hash.clone(), header)
+    }
+
+    fn remove_header_meta(&self, hash: Hash) {
+        self.header_meta.remove_header_metadata(hash)
+    }
 }
 
 pub struct KvStoreChain<K: KvStore> {
@@ -63,7 +140,7 @@ pub struct KvStoreChain<K: KvStore> {
 }
 
 impl<K: KvStore> KvStoreChain<K> {
-    pub fn new(kv_store: K) -> Result<KvStoreChain<K>, BlockchainError> {
+    pub fn new(kv_store: K) -> Result<KvStoreChain<K>> {
         let mut chain = KvStoreChain::<K> { database: kv_store };
         if chain.get_height()? == 0 {
             chain.apply_block(&genesis::get_genesis_block(), false)?;
@@ -78,7 +155,7 @@ impl<K: KvStore> KvStoreChain<K> {
     }
 
     #[cfg(feature = "pow")]
-    fn next_difficulty(&self) -> Result<u32, BlockchainError> {
+    fn next_difficulty(&self) -> Result<u32> {
         let height = self.get_height()?;
         let last_block = self.get_block(height - 1)?.header;
         if height % config::DIFFICULTY_CALC_INTERVAL == 0 {
@@ -95,7 +172,7 @@ impl<K: KvStore> KvStoreChain<K> {
         }
     }
 
-    fn get_block(&self, index: usize) -> Result<Block, BlockchainError> {
+    fn get_block(&self, index: usize) -> Result<Block> {
         if index >= self.get_height()? {
             return Err(BlockchainError::BlockNotFound);
         }
@@ -108,7 +185,7 @@ impl<K: KvStore> KvStoreChain<K> {
         })
     }
 
-    fn apply_tx(&mut self, tx: &Transaction) -> Result<(), BlockchainError> {
+    fn apply_tx(&mut self, tx: &Transaction) -> Result<()> {
         let mut ops = Vec::new();
         if !tx.verify_signature() {
             return Err(BlockchainError::SignatureError);
@@ -151,7 +228,7 @@ impl<K: KvStore> KvStoreChain<K> {
         Ok(())
     }
 
-    pub fn rollback_block(&mut self) -> Result<(), BlockchainError> {
+    pub fn rollback_block(&mut self) -> Result<()> {
         let height = self.get_height()?;
         let rollback_key: StringKey = format!("rollback_{:010}", height - 1).into();
         let mut rollback: Vec<WriteOp> = match self.database.get(rollback_key.clone())? {
@@ -169,10 +246,7 @@ impl<K: KvStore> KvStoreChain<K> {
         Ok(())
     }
 
-    fn select_transactions(
-        &self,
-        txs: &Vec<Transaction>,
-    ) -> Result<Vec<Transaction>, BlockchainError> {
+    fn select_transactions(&self, txs: &Vec<Transaction>) -> Result<Vec<Transaction>> {
         let mut sorted = txs.clone();
         sorted.sort_by(|t1, t2| t1.nonce.cmp(&t2.nonce));
         let mut fork = self.fork_on_ram();
@@ -185,7 +259,7 @@ impl<K: KvStore> KvStoreChain<K> {
         Ok(result)
     }
 
-    fn apply_block(&mut self, block: &Block, draft: bool) -> Result<(), BlockchainError> {
+    fn apply_block(&mut self, block: &Block, draft: bool) -> Result<()> {
         let curr_height = self.get_height()?;
 
         #[cfg(feature = "pow")]
@@ -247,7 +321,7 @@ impl<K: KvStore> KvStoreChain<K> {
 }
 
 impl<K: KvStore> Blockchain for KvStoreChain<K> {
-    fn get_account(&self, addr: Address) -> Result<Account, BlockchainError> {
+    fn get_account(&self, addr: Address) -> Result<Account> {
         let k = format!("account_{}", addr).into();
         Ok(match self.database.get(k)? {
             Some(b) => b.try_into()?,
@@ -263,12 +337,12 @@ impl<K: KvStore> Blockchain for KvStoreChain<K> {
     }
 
     #[cfg(feature = "pos")]
-    fn will_extend(&self, _from: usize, _headers: &Vec<Header>) -> Result<bool, BlockchainError> {
+    fn will_extend(&self, _from: usize, _headers: &Vec<Header>) -> Result<bool> {
         unimplemented!();
     }
 
     #[cfg(feature = "pow")]
-    fn will_extend(&self, from: usize, headers: &Vec<Header>) -> Result<bool, BlockchainError> {
+    fn will_extend(&self, from: usize, headers: &Vec<Header>) -> Result<bool> {
         let current_power = self.get_power()?;
 
         if from == 0 {
@@ -304,7 +378,7 @@ impl<K: KvStore> Blockchain for KvStoreChain<K> {
 
         Ok(new_power > current_power)
     }
-    fn extend(&mut self, from: usize, blocks: &Vec<Block>) -> Result<(), BlockchainError> {
+    fn extend(&mut self, from: usize, blocks: &Vec<Block>) -> Result<()> {
         let curr_height = self.get_height()?;
 
         if from == 0 {
@@ -327,28 +401,20 @@ impl<K: KvStore> Blockchain for KvStoreChain<K> {
         self.database.update(&ops)?;
         Ok(())
     }
-    fn get_height(&self) -> Result<usize, BlockchainError> {
+    fn get_height(&self) -> Result<usize> {
         Ok(match self.database.get("height".into())? {
             Some(b) => b.try_into()?,
             None => 0,
         })
     }
-    fn get_headers(
-        &self,
-        since: usize,
-        until: Option<usize>,
-    ) -> Result<Vec<Header>, BlockchainError> {
+    fn get_headers(&self, since: usize, until: Option<usize>) -> Result<Vec<Header>> {
         Ok(self
             .get_blocks(since, until)?
             .into_iter()
             .map(|b| b.header)
             .collect())
     }
-    fn get_blocks(
-        &self,
-        since: usize,
-        until: Option<usize>,
-    ) -> Result<Vec<Block>, BlockchainError> {
+    fn get_blocks(&self, since: usize, until: Option<usize>) -> Result<Vec<Block>> {
         let mut blks: Vec<Block> = Vec::new();
         let height = self.get_height()?;
         for i in since..until.unwrap_or(height) {
@@ -364,11 +430,7 @@ impl<K: KvStore> Blockchain for KvStoreChain<K> {
         }
         Ok(blks)
     }
-    fn draft_block(
-        &self,
-        mempool: &Vec<Transaction>,
-        _wallet: &Wallet,
-    ) -> Result<Block, BlockchainError> {
+    fn draft_block(&self, mempool: &Vec<Transaction>, _wallet: &Wallet) -> Result<Block> {
         let height = self.get_height()?;
         let last_block = self.get_block(height - 1)?;
         let mut blk = Block {
@@ -386,7 +448,7 @@ impl<K: KvStore> Blockchain for KvStoreChain<K> {
         Ok(blk)
     }
     #[cfg(feature = "pow")]
-    fn get_power(&self) -> Result<u64, BlockchainError> {
+    fn get_power(&self) -> Result<u64> {
         let height = self.get_height()?;
         if height == 0 {
             Ok(0)
@@ -399,7 +461,7 @@ impl<K: KvStore> Blockchain for KvStoreChain<K> {
         }
     }
     #[cfg(feature = "pow")]
-    fn pow_key(&self, index: usize) -> Result<Vec<u8>, BlockchainError> {
+    fn pow_key(&self, index: usize) -> Result<Vec<u8>> {
         Ok(if index < 64 {
             config::POW_BASE_KEY.to_vec()
         } else {

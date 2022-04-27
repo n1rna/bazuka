@@ -1,6 +1,6 @@
 use super::address::{Address, Signature};
 use super::contract::{Circuit, CircuitProof, ContractId, ContractPayment, ContractState};
-use super::hash::Hash;
+use super::hash::Hashing;
 use super::Money;
 use crate::crypto::SignatureScheme;
 
@@ -50,7 +50,7 @@ pub struct Transaction<S: SignatureScheme> {
 }
 
 impl<S: SignatureScheme> Transaction<S> {
-    pub fn hash<H: Hash>(&self) -> H::Output {
+    pub fn hash<H: Hashing>(&self) -> H::Output {
         H::hash(&bincode::serialize(self).unwrap())
     }
     pub fn verify_signature(&self) -> bool {

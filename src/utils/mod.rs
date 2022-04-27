@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use decode::*;
 
+mod concurrent_data;
 mod decode;
 
 pub fn local_timestamp() -> u64 {

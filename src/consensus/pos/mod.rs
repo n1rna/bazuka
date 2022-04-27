@@ -8,6 +8,7 @@ mod epoch;
 mod slots;
 
 pub mod digest;
+mod fork_tree;
 
 pub type Result<T> = core::result::Result<T, Error>;
 

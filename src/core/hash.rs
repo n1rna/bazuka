@@ -8,7 +8,7 @@ use sha3::{Digest, Sha3_256, Sha3_256Core};
 
 use super::{AutoDeserialize, AutoHash, AutoSerialize, MemberBound};
 
-pub trait Hash: Debug + Clone + 'static {
+pub trait Hashing: Debug + Clone + 'static {
     /// The length in bytes of the Hasher output
     const LENGTH: usize;
 
@@ -28,6 +28,8 @@ pub trait Hash: Debug + Clone + 'static {
 
     fn finalize(self) -> Self::Output;
 }
+
+pub type Hash256 = [u8; 32];
 
 #[derive(Debug, Clone)]
 pub struct Sha3Hasher(Option<CoreWrapper<Sha3_256Core>>);
@@ -94,10 +96,10 @@ impl FromStr for Sha3Hasher {
     }
 }
 
-impl Hash for Sha3Hasher {
+impl Hashing for Sha3Hasher {
     const LENGTH: usize = 32;
     // U32 is copy from the macro named impl_sha3 in RustCrypto
-    type Output = [u8; 32];
+    type Output = Hash256;
 
     fn hash(s: &[u8]) -> Self::Output {
         let mut h = Sha3_256::new();
@@ -129,7 +131,7 @@ pub enum HasherError {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::hash::Hash;
+    use crate::core::hash::Hashing;
     use crate::core::hash::Sha3Hasher;
 
     #[test]

@@ -4,7 +4,7 @@ use super::digest::{Digest, Digests};
 #[cfg(feature = "pow")]
 use rust_randomx::{Difficulty, Output};
 
-use super::hash::Hash;
+use super::hash::Hashing;
 
 #[cfg(feature = "pow")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -29,7 +29,7 @@ impl Default for ProofOfWork {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Header<H: Hash> {
+pub struct Header<H: Hashing> {
     /// the parent hash
     pub parent_hash: H::Output,
     /// block number or block height
@@ -48,7 +48,7 @@ pub struct Header<H: Hash> {
     pub proof_of_work: ProofOfWork,
 }
 
-impl<H: Hash> Default for Header<H> {
+impl<H: Hashing> Default for Header<H> {
     fn default() -> Self {
         Header {
             parent_hash: H::Output::default(),
@@ -65,7 +65,7 @@ impl<H: Hash> Default for Header<H> {
     }
 }
 
-impl<H: Hash> Header<H> {
+impl<H: Hashing> Header<H> {
     pub fn hash(&self) -> H::Output {
         H::hash(&bincode::serialize(&self).expect("convert header to bincode format"))
     }

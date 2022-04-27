@@ -1,10 +1,51 @@
-use crate::core::{Account, Block, Hasher};
-use crate::crypto::merkle::MerkleTree;
+use std::collections::HashMap;
+
 use db_key::Key;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use thiserror::Error;
+
+#[cfg(feature = "node")]
+pub use disk::*;
+pub use ram::*;
+use Change::{Remove, Set};
+
+use crate::core::{Account, Address, Block, Hasher, Header, Money};
+use crate::crypto::merkle::MerkleTree;
+use crate::db::key_space::KeySpace;
+
+pub mod key_space;
+
+pub type Result<T> = core::result::Result<T, KvStoreError>;
+
+#[derive(Clone)]
+pub enum Change {
+    Set(KeySpace, Vec<u8>, Blob),
+    Remove(KeySpace, Vec<u8>),
+}
+
+#[derive(Clone, Default)]
+pub struct Batch(pub Vec<Change>);
+
+impl Batch {
+    pub fn new() -> Self {
+        Batch(Vec::new())
+    }
+
+    pub fn set(&mut self, space: KeySpace, key: &[u8], value: Blob) {
+        self.0.push(Set(space, key.to_vec(), value))
+    }
+
+    pub fn remove(&mut self, space: KeySpace, key: &[u8]) {
+        self.0.push(Remove(space, key.to_vec()))
+    }
+}
+
+pub trait Database: Sync + Send {
+    fn backend() -> &'static str;
+    fn get(&self, space: KeySpace, key: &[u8]) -> Result<Option<Blob>>;
+    fn batch(&self, batch: &Batch) -> Result<()>;
+}
 
 #[derive(Error, Debug)]
 pub enum KvStoreError {
@@ -12,6 +53,8 @@ pub enum KvStoreError {
     Failure,
     #[error("kvstore data corrupted")]
     Corrupted(#[from] bincode::Error),
+    #[error("{0}")]
+    Custom(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,27 +67,21 @@ impl StringKey {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Blob(Vec<u8>);
+pub struct Blob(pub Vec<u8>);
+
+impl From<Vec<u8>> for Blob {
+    fn from(v: Vec<u8>) -> Self {
+        Blob(v)
+    }
+}
 
 macro_rules! gen_try_into {
     ( $( $x:ty ),* ) => {
         $(
             impl TryInto<$x> for Blob {
                 type Error = KvStoreError;
-                fn try_into(self) -> Result<$x, Self::Error> {
+                fn try_into(self) -> core::result::Result<$x, Self::Error> {
                     Ok(bincode::deserialize(&self.0)?)
-                }
-            }
-        )*
-    };
-}
-
-macro_rules! gen_from {
-    ( $( $x:ty ),* ) => {
-        $(
-            impl From<$x> for Blob {
-                fn from(n: $x) -> Self {
-                    Self(bincode::serialize(&n).unwrap())
                 }
             }
         )*
@@ -60,6 +97,7 @@ gen_try_into!(
     Vec<WriteOp>,
     MerkleTree<Hasher>
 );
+
 gen_from!(
     u32,
     u64,
@@ -85,6 +123,7 @@ impl From<String> for StringKey {
         Self::new(&s)
     }
 }
+
 impl From<&str> for StringKey {
     fn from(s: &str) -> Self {
         Self::new(s)
@@ -98,9 +137,9 @@ pub enum WriteOp {
 }
 
 pub trait KvStore {
-    fn get(&self, k: StringKey) -> Result<Option<Blob>, KvStoreError>;
-    fn update(&mut self, ops: &Vec<WriteOp>) -> Result<(), KvStoreError>;
-    fn rollback_of(&self, ops: &Vec<WriteOp>) -> Result<Vec<WriteOp>, KvStoreError> {
+    fn get(&self, k: StringKey) -> core::result::Result<Option<Blob>, KvStoreError>;
+    fn update(&mut self, ops: &Vec<WriteOp>) -> core::result::Result<(), KvStoreError>;
+    fn rollback_of(&self, ops: &Vec<WriteOp>) -> core::result::Result<Vec<WriteOp>, KvStoreError> {
         let mut rollback = Vec::new();
         for op in ops.iter() {
             let key = match op {
@@ -121,6 +160,7 @@ pub struct LruCacheKvStore<K: KvStore> {
     store: K,
     cache: LruCache<String, Option<Blob>>,
 }
+
 impl<K: KvStore> LruCacheKvStore<K> {
     pub fn new(store: K, cap: usize) -> Self {
         Self {
@@ -131,7 +171,7 @@ impl<K: KvStore> LruCacheKvStore<K> {
 }
 
 impl<K: KvStore> KvStore for LruCacheKvStore<K> {
-    fn get(&self, k: StringKey) -> Result<Option<Blob>, KvStoreError> {
+    fn get(&self, k: StringKey) -> core::result::Result<Option<Blob>, KvStoreError> {
         unsafe {
             let mutable = &mut *(self as *const Self as *mut Self);
             if let Some(v) = mutable.cache.get(&k.0) {
@@ -143,7 +183,7 @@ impl<K: KvStore> KvStore for LruCacheKvStore<K> {
             }
         }
     }
-    fn update(&mut self, ops: &Vec<WriteOp>) -> Result<(), KvStoreError> {
+    fn update(&mut self, ops: &Vec<WriteOp>) -> core::result::Result<(), KvStoreError> {
         for op in ops.into_iter() {
             match op {
                 WriteOp::Remove(k) => self.cache.pop(&k.0),
@@ -158,6 +198,7 @@ pub struct RamMirrorKvStore<'a, K: KvStore> {
     store: &'a K,
     overwrite: HashMap<String, Option<Blob>>,
 }
+
 impl<'a, K: KvStore> RamMirrorKvStore<'a, K> {
     pub fn new(store: &'a K) -> Self {
         Self {
@@ -177,14 +218,14 @@ impl<'a, K: KvStore> RamMirrorKvStore<'a, K> {
 }
 
 impl<'a, K: KvStore> KvStore for RamMirrorKvStore<'a, K> {
-    fn get(&self, k: StringKey) -> Result<Option<Blob>, KvStoreError> {
+    fn get(&self, k: StringKey) -> core::result::Result<Option<Blob>, KvStoreError> {
         if self.overwrite.contains_key(&k.0) {
             Ok(self.overwrite.get(&k.0).cloned().unwrap())
         } else {
             self.store.get(k)
         }
     }
-    fn update(&mut self, ops: &Vec<WriteOp>) -> Result<(), KvStoreError> {
+    fn update(&mut self, ops: &Vec<WriteOp>) -> core::result::Result<(), KvStoreError> {
         for op in ops.into_iter() {
             match op {
                 WriteOp::Remove(k) => self.overwrite.insert(k.0.clone(), None),
@@ -195,10 +236,26 @@ impl<'a, K: KvStore> KvStore for RamMirrorKvStore<'a, K> {
     }
 }
 
-mod ram;
-pub use ram::*;
-
 #[cfg(feature = "node")]
 mod disk;
-#[cfg(feature = "node")]
-pub use disk::*;
+mod ram;
+
+#[inline]
+pub fn number_key<N: TryInto<u64>>(n: N) -> Result<[u8; 8]>
+where
+    <N as TryInto<u64>>::Error: std::fmt::Display,
+{
+    let n = n
+        .try_into()
+        .map_err(|e| KvStoreError::Custom(format!("{}", e)))?;
+    Ok([
+        (n >> 56) as u8,
+        ((n >> 48) & 0xff) as u8,
+        ((n >> 40) & 0xff) as u8,
+        ((n >> 32) & 0xff) as u8,
+        ((n >> 24) & 0xff) as u8,
+        ((n >> 16) & 0xff) as u8,
+        ((n >> 8) & 0xff) as u8,
+        (n & 0xff) as u8,
+    ])
+}

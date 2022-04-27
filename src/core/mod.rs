@@ -1,3 +1,7 @@
+use std::fmt::Debug;
+
+use crate::crypto;
+
 mod address;
 mod blocks;
 mod contract;
@@ -10,12 +14,9 @@ pub mod digest;
 pub mod hash;
 pub mod number;
 
-use std::fmt::Debug;
-
-use crate::crypto;
-
 pub type Money = u64;
 pub type Signer = crypto::EdDSA;
+pub type Hash = hash::Hash256;
 pub type Hasher = hash::Sha3Hasher;
 pub type Address = address::Address<Signer>;
 pub type Account = address::Account;
@@ -24,6 +25,7 @@ pub type Transaction = transaction::Transaction<Signer>;
 pub type TransactionData = transaction::TransactionData<Signer>;
 pub type Header = header::Header<Hasher>;
 pub type Block = blocks::Block<Hasher, Signer>;
+pub type BlockId = blocks::BlockId;
 
 #[cfg(feature = "pow")]
 pub type ProofOfWork = header::ProofOfWork;

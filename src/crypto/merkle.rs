@@ -1,12 +1,12 @@
-use crate::core::hash::Hash;
+use crate::core::hash::Hashing;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MerkleTree<H: Hash> {
+pub struct MerkleTree<H: Hashing> {
     data: Vec<H::Output>,
 }
 
-fn merge_hash<H: Hash>(a: &H::Output, b: &H::Output) -> H::Output {
+fn merge_hash<H: Hashing>(a: &H::Output, b: &H::Output) -> H::Output {
     let mut inp = Vec::new();
     if a < b {
         inp.extend(a.as_ref());
@@ -18,7 +18,7 @@ fn merge_hash<H: Hash>(a: &H::Output, b: &H::Output) -> H::Output {
     H::hash(&inp)
 }
 
-impl<H: Hash> MerkleTree<H> {
+impl<H: Hashing> MerkleTree<H> {
     pub fn depth(&self) -> u32 {
         let len = self.data.len();
         if len == 1 {
